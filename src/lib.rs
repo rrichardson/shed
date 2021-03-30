@@ -72,8 +72,13 @@ impl Shed {
      *  Subscribe to writes to this shed using a prefix.
      *  This returns a Pipe which implements Stream and some other stuff
      */
-    pub fn pipe_subscribe<K: Encodable + std::fmt::Debug, V: Encodable + std::fmt::Debug>(&self, prefix: &[u8], history: bool) -> Pipe<K, V> {
-        Pipe::from_source(Source(self.tree.watch_prefix(prefix)), prefix)
+    pub fn pipe_subscribe<K: Encodable + std::fmt::Debug, V: Encodable + std::fmt::Debug>(&self, prefix: &[u8], starting_at: Option<K>) -> Pipe<K, V> {
+        let history = starting_at.and_then(|start| {
+            let key = start.encode().ok()?;
+            let iter = self.tree.range(sled::IVec::from(key)..);
+            Some(iter)
+        });
+        Pipe::from_source(Source(self.tree.watch_prefix(prefix)), prefix, history)
     }
 
     pub fn pipe_subscribe_chunked<K, V>(&self, prefix: &[u8], chunk: ChunkType) -> PipeChunked<K, V>
@@ -160,6 +165,7 @@ pub struct Pipe<K,V> {
     #[pin]
     src: Source,
     prefix: Vec<u8>,
+    history: Option<sled::Iter>,
     _pv: PhantomData<V>,
     _pk: PhantomData<K>,
 }
@@ -168,9 +174,10 @@ impl<K, V> Pipe<K, V>
 where K: Encodable + std::fmt::Debug,
       V: Encodable + std::fmt::Debug
 {
-    pub fn from_source<P: AsRef<[u8]>>(src: Source, prefix: P) -> Pipe<K, V> {
+    pub fn from_source<P: AsRef<[u8]>>(src: Source, prefix: P, history: Option<sled::Iter>) -> Pipe<K, V> {
         Pipe {
             src,
+            history,
             prefix: prefix.as_ref().to_vec(),
             _pv: PhantomData,
             _pk: PhantomData,
@@ -190,8 +197,21 @@ impl<K,V> Stream for Pipe<K,V>
 {
     type Item = Result<(K,V), anyhow::Error>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<(K,V), anyhow::Error>>> {
-        let prefix_len = self.prefix.len();
-        let res = ready!(self.project().src.as_mut().poll(cx)).and_then(|event: sled::Event|
+        let mut this = self.project();
+        let prefix_len = this.prefix.len();
+        // first fetch from our historical iterator if it exists
+        if let Some(mut iter) = this.history.take() {
+            if let Some(entry) = iter.next() {
+                let res = match entry {
+                    Ok((kk, vv)) => Some(Self::unpack(prefix_len, kk, vv)),
+                    Err(e) => Some(Err(anyhow::Error::new(e)))
+                };
+                *this.history = Some(iter);
+                return Poll::Ready(res);
+            }
+        }
+        // if we're still here, the iterator is out, so let's
+        let res = ready!(this.src.as_mut().poll(cx)).and_then(|event: sled::Event|
                 match event {
                     sled::Event::Insert{ key, value } => Some(Self::unpack(prefix_len, key, value)),
                     sled::Event::Remove{key: _} => None,
@@ -215,7 +235,7 @@ where K: Encodable + Send + std::fmt::Debug + 'static,
       V: Encodable + Send + std::fmt::Debug + 'static
 {
     pub fn from_source_and_type<P: AsRef<[u8]>>(src: Source, prefix: P, chunk: ChunkType) -> PipeChunked<K, V> {
-        let pipe = Pipe::from_source(src, prefix);
+        let pipe = Pipe::from_source(src, prefix, None);
         let inner =
             match chunk {
                 ChunkType::Count(sz) => {
