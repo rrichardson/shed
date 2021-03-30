@@ -49,7 +49,6 @@ impl Shed {
                 let mut kk = k.encode()?;
                 let vv = v.encode()?;
                 key.append(&mut kk);
-                println!("Writing {:?} -> {:?}", key, vv);
                 tree.insert(&key, vv)?;
             }
             Ok(())
@@ -73,13 +72,13 @@ impl Shed {
      *  Subscribe to writes to this shed using a prefix.
      *  This returns a Pipe which implements Stream and some other stuff
      */
-    pub fn pipe_subscribe<K: Encodable, V: Encodable>(&self, prefix: &[u8]) -> Pipe<K, V> {
+    pub fn pipe_subscribe<K: Encodable + std::fmt::Debug, V: Encodable + std::fmt::Debug>(&self, prefix: &[u8], history: bool) -> Pipe<K, V> {
         Pipe::from_source(Source(self.tree.watch_prefix(prefix)), prefix)
     }
 
     pub fn pipe_subscribe_chunked<K, V>(&self, prefix: &[u8], chunk: ChunkType) -> PipeChunked<K, V>
-        where K: Encodable + Send + 'static,
-              V: Encodable + Send + 'static,
+        where K: Encodable + Send + std::fmt::Debug + 'static,
+              V: Encodable + Send + std::fmt::Debug + 'static,
     {
         PipeChunked::from_source_and_type(Source(self.tree.watch_prefix(prefix)), prefix, chunk)
     }
@@ -104,7 +103,7 @@ impl Shed {
         Hose{}
     }
 
-    pub fn manifold_stream<M: Manifold>(&self) -> stream::SelectAll<Pin<Box<dyn Stream<Item = Result<(Vec<u8>, M), anyhow::Error>> + Send>>> {
+    pub fn manifold_subscribe<M: Manifold>(&self) -> stream::SelectAll<Pin<Box<dyn Stream<Item = Result<M, anyhow::Error>> + Send>>> {
         M::connect(Store(self.tree.clone()))
     }
 }
@@ -142,7 +141,7 @@ where T: Serialize + DeserializeOwned
 pub trait Manifold
     where Self: Sized
 {
-    fn connect(ds: Store) -> stream::SelectAll<Pin<Box<dyn Stream<Item = Result<(Vec<u8>, Self), anyhow::Error>> + Send>>>;
+    fn connect(ds: Store) -> stream::SelectAll<Pin<Box<dyn Stream<Item = Result<Self, anyhow::Error>> + Send>>>;
 }
 
 #[pin_project]
@@ -166,8 +165,8 @@ pub struct Pipe<K,V> {
 }
 
 impl<K, V> Pipe<K, V>
-where K: Encodable,
-      V: Encodable
+where K: Encodable + std::fmt::Debug,
+      V: Encodable + std::fmt::Debug
 {
     pub fn from_source<P: AsRef<[u8]>>(src: Source, prefix: P) -> Pipe<K, V> {
         Pipe {
@@ -179,15 +178,15 @@ where K: Encodable,
     }
 
     fn unpack(prefix_len: usize, key: sled::IVec, value: sled::IVec) -> Result<(K, V), anyhow::Error> {
-        let v = V::decode(value)?;
         let k = K::decode(&key[prefix_len..])?;
-        Ok((k, v))
+        let v = V::decode(value)?;
+        Ok((k,v))
     }
 }
 
 impl<K,V> Stream for Pipe<K,V>
-    where V: Encodable,
-          K: Encodable
+    where V: Encodable + std::fmt::Debug,
+          K: Encodable + std::fmt::Debug
 {
     type Item = Result<(K,V), anyhow::Error>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<(K,V), anyhow::Error>>> {
@@ -200,6 +199,7 @@ impl<K,V> Stream for Pipe<K,V>
         Poll::Ready(res)
     }
 }
+
 #[must_use = "streams do nothing unless polled"]
 #[pin_project]
 pub struct PipeChunked<K,V>
@@ -211,8 +211,8 @@ where K: Encodable + Send,
 }
 
 impl<K, V> PipeChunked<K, V>
-where K: Encodable + Send + 'static,
-      V: Encodable + Send + 'static
+where K: Encodable + Send + std::fmt::Debug + 'static,
+      V: Encodable + Send + std::fmt::Debug + 'static
 {
     pub fn from_source_and_type<P: AsRef<[u8]>>(src: Source, prefix: P, chunk: ChunkType) -> PipeChunked<K, V> {
         let pipe = Pipe::from_source(src, prefix);
@@ -244,8 +244,8 @@ impl<K,V> Stream for PipeChunked<K,V>
 
 #[pin_project]
 pub struct IntervalChunks<K, V>
-    where K: Encodable + Send + 'static,
-          V: Encodable + Send + 'static,
+    where K: Encodable + std::fmt::Debug + Send + 'static,
+          V: Encodable + std::fmt::Debug + Send + 'static,
 {
     #[pin]
     inner: SelectAll<Box<dyn Stream<Item = Either<Result<(K, V), anyhow::Error>, ()>> + Send + Unpin>>,
@@ -253,8 +253,8 @@ pub struct IntervalChunks<K, V>
 }
 
 impl<K, V> IntervalChunks<K, V>
-    where K: Encodable + Send + 'static,
-          V: Encodable + Send + 'static,
+    where K: Encodable + std::fmt::Debug + Send + 'static,
+          V: Encodable + std::fmt::Debug + Send + 'static,
 {
     pub fn from_pipe(pipe: Pipe<K, V>, dur: Duration) -> IntervalChunks<K, V> {
         let p = pipe.map(|i| Either::Left(i));
@@ -270,8 +270,8 @@ impl<K, V> IntervalChunks<K, V>
 }
 
 impl<K, V> Stream for IntervalChunks<K, V>
-    where K: Encodable + Send + 'static,
-          V: Encodable + Send + 'static,
+    where K: Encodable + std::fmt::Debug + Send + 'static,
+          V: Encodable + std::fmt::Debug + Send + 'static,
 {
     type Item = Vec<Result<(K, V), anyhow::Error>>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
