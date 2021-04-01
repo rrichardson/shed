@@ -73,7 +73,7 @@ impl Builder {
             let streams = self.gen_stream_members();
             quote! {
                 impl #impl_generics Manifold for #typename #ty_generics #where_clause {
-                    fn connect(ds: Store) -> ::futures::stream::SelectAll<Pin<Box<dyn ::futures::Stream<Item = Result<Self, anyhow::Error>> + Send>>> {
+                    fn connect(ds: Store) -> ::futures::stream::SelectAll<Pin<Box<dyn ::futures::Stream<Item = std::result::Result<Self, anyhow::Error>> + Send>>> {
                         ::futures::stream::select_all(vec![
                         #(#streams)*
                         ])
@@ -95,7 +95,7 @@ impl Builder {
                     let name = v.0.ident.clone();
                     let prefix = v.1.clone();
                     quote! {
-                        Pipe::from_source(Source(ds.0.watch_prefix(#prefix)), #prefix).map(|res| res.map(|(k, v)| #typename::#name((k, v)) )).boxed(),
+                        Pipe::from_source(Source(ds.0.watch_prefix(#prefix)), #prefix, None).map(|res| res.map(|(k, v)| #typename::#name((k, v)) )).boxed(),
                     }
                 })
             },
