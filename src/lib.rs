@@ -78,49 +78,51 @@ impl Shed {
      *  Subscribe to writes to this shed using a prefix.
      *  This returns a Pipe which implements Stream and some other stuff
      */
-    pub fn pipe_subscribe<K: Encodable + std::fmt::Debug, V: Encodable + std::fmt::Debug>(
+    pub fn pipe_subscribe<
+        K: Encodable + std::fmt::Debug,
+        V: Encodable + std::fmt::Debug,
+    >(
         &self,
         prefix: &[u8],
         history: History<K>,
     ) -> Result<Pipe<K, V>, anyhow::Error> {
-        let iter = match history {
-            History::All => {
-                let start = self.tree.get_gt(sled::IVec::from(prefix))?;
-                let scan = self.tree.scan_prefix(sled::IVec::from(prefix));
-                let last = scan.last();
-                if let Some((begin, _)) = start {
-                    if let Some(Ok((end, _))) = last {
-                        Some(
-                            self.tree
-                                .range(sled::IVec::from(begin)..=sled::IVec::from(end)),
-                        )
+        let iter =
+            match history {
+                History::All => {
+                    let start = self.tree.get_gt(sled::IVec::from(prefix))?;
+                    let scan = self.tree.scan_prefix(sled::IVec::from(prefix));
+                    let last = scan.last();
+                    if let Some((begin, _)) = start {
+                        if let Some(Ok((end, _))) = last {
+                            Some(self.tree.range(
+                                sled::IVec::from(begin)..=sled::IVec::from(end),
+                            ))
+                        } else {
+                            Some(self.tree.range(sled::IVec::from(begin)..))
+                        }
                     } else {
-                        Some(self.tree.range(sled::IVec::from(begin)..))
+                        None
                     }
-                } else {
-                    None
                 }
-            }
-            History::Start(k) => {
-                let key = k.encode()?;
-                let start = prefix
-                    .iter()
-                    .map(|a| *a)
-                    .chain(key.into_iter())
-                    .collect::<Vec<u8>>();
-                let scan = self.tree.scan_prefix(sled::IVec::from(prefix));
-                let last = scan.last();
-                if let Some(Ok((end, _))) = last {
-                    Some(
-                        self.tree
-                            .range(sled::IVec::from(start)..=sled::IVec::from(end)),
-                    )
-                } else {
-                    Some(self.tree.range(sled::IVec::from(start)..))
+                History::Start(k) => {
+                    let key = k.encode()?;
+                    let start = prefix
+                        .iter()
+                        .map(|a| *a)
+                        .chain(key.into_iter())
+                        .collect::<Vec<u8>>();
+                    let scan = self.tree.scan_prefix(sled::IVec::from(prefix));
+                    let last = scan.last();
+                    if let Some(Ok((end, _))) = last {
+                        Some(self.tree.range(
+                            sled::IVec::from(start)..=sled::IVec::from(end),
+                        ))
+                    } else {
+                        Some(self.tree.range(sled::IVec::from(start)..))
+                    }
                 }
-            }
-            History::None => None,
-        };
+                History::None => None,
+            };
         Ok(Pipe::from_source(
             Source(self.tree.watch_prefix(prefix)),
             prefix,
@@ -128,19 +130,32 @@ impl Shed {
         ))
     }
 
-    pub fn pipe_subscribe_chunked<K, V>(&self, prefix: &[u8], chunk: ChunkType) -> PipeChunked<K, V>
+    pub fn pipe_subscribe_chunked<K, V>(
+        &self,
+        prefix: &[u8],
+        chunk: ChunkType,
+    ) -> PipeChunked<K, V>
     where
         K: Encodable + Send + std::fmt::Debug + 'static,
         V: Encodable + Send + std::fmt::Debug + 'static,
     {
-        PipeChunked::from_source_and_type(Source(self.tree.watch_prefix(prefix)), prefix, chunk)
+        PipeChunked::from_source_and_type(
+            Source(self.tree.watch_prefix(prefix)),
+            prefix,
+            chunk,
+        )
     }
 
     /*
      *  A hose is like a pipe, but it's more flexible.
      *  hose subscribes to a stream, applies a function, then writes it to a new key
      */
-    pub fn hose<F, K, V>(&self, subscribe_key: &[u8], output_prefix: &[u8], fun: F) -> Hose
+    pub fn hose<F, K, V>(
+        &self,
+        subscribe_key: &[u8],
+        output_prefix: &[u8],
+        fun: F,
+    ) -> Hose
     where
         F: Fn(&[u8]) -> Option<(K, V)>,
         V: Encodable,
@@ -149,7 +164,12 @@ impl Shed {
         Hose {}
     }
 
-    pub fn chunked_hose<F, K, V>(&self, subscribe_key: &[u8], output_prefix: &[u8], fun: F) -> Hose
+    pub fn chunked_hose<F, K, V>(
+        &self,
+        subscribe_key: &[u8],
+        output_prefix: &[u8],
+        fun: F,
+    ) -> Hose
     where
         F: Fn(&[u8]) -> Option<(K, V)>,
         V: Encodable,
@@ -160,7 +180,9 @@ impl Shed {
 
     pub fn manifold_subscribe<M: Manifold>(
         &self,
-    ) -> stream::SelectAll<Pin<Box<dyn Stream<Item = Result<M, anyhow::Error>> + Send>>> {
+    ) -> stream::SelectAll<
+        Pin<Box<dyn Stream<Item = Result<M, anyhow::Error>> + Send>>,
+    > {
         M::connect(Store(self.tree.clone()))
     }
 }
@@ -205,7 +227,9 @@ where
 {
     fn connect(
         ds: Store,
-    ) -> stream::SelectAll<Pin<Box<dyn Stream<Item = Result<Self, anyhow::Error>> + Send>>>;
+    ) -> stream::SelectAll<
+        Pin<Box<dyn Stream<Item = Result<Self, anyhow::Error>> + Send>>,
+    >;
 }
 
 #[pin_project]
@@ -225,6 +249,7 @@ pub struct Pipe<K, V> {
     src: Source,
     prefix: Vec<u8>,
     history: Option<sled::Iter>,
+    batch: Option<Vec<Result<(K, V), anyhow::Error>>>,
     _pv: PhantomData<V>,
     _pk: PhantomData<K>,
 }
@@ -242,6 +267,7 @@ where
         Pipe {
             src,
             history,
+            batch: None,
             prefix: prefix.as_ref().to_vec(),
             _pv: PhantomData,
             _pk: PhantomData,
@@ -250,8 +276,8 @@ where
 
     fn unpack(
         prefix_len: usize,
-        key: sled::IVec,
-        value: sled::IVec,
+        key: &sled::IVec,
+        value: &sled::IVec,
     ) -> Result<(K, V), anyhow::Error> {
         let k = K::decode(&key[prefix_len..])?;
         let v = V::decode(value)?;
@@ -275,7 +301,7 @@ where
         if let Some(mut iter) = this.history.take() {
             if let Some(entry) = iter.next() {
                 let res = match entry {
-                    Ok((kk, vv)) => Some(Self::unpack(prefix_len, kk, vv)),
+                    Ok((kk, vv)) => Some(Self::unpack(prefix_len, &kk, &vv)),
                     Err(e) => {
                         println!("{:?}", &e);
                         Some(Err(anyhow::Error::new(e)))
@@ -289,11 +315,28 @@ where
         } else {
             println!("no history?");
         }
-        // if we're still here, the iterator is out, so let's
-        let res = ready!(this.src.as_mut().poll(cx)).and_then(|event: sled::Event| match event {
-            sled::Event::Insert { key, value } => Some(Self::unpack(prefix_len, key, value)),
-            sled::Event::Remove { key: _ } => None,
-        });
+        // no historical iterator, let's try a batch that we got from polling
+        if let Some(entry) = this.batch.as_mut().and_then(|b| b.pop()) {
+            return Poll::Ready(Some(entry));
+        }
+        // if we're still here, the iterator and the batch is out, so let's
+        // poll for a new batch and return an item from it
+        let res = ready!(this.src.as_mut().poll(cx)).and_then(
+            |event: sled::Event| {
+                let mut b = event
+                    .iter()
+                    .filter_map(|e| match e {
+                        (_, key, Some(val)) => {
+                            Some(Self::unpack(prefix_len, key, val))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<Result<(K, V), anyhow::Error>>>();
+                let res = b.pop();
+                this.batch.replace(b);
+                res
+            },
+        );
         Poll::Ready(res)
     }
 }
@@ -322,9 +365,17 @@ where
         let pipe = Pipe::from_source(src, prefix, None);
         let inner = match chunk {
             ChunkType::Count(sz) => Box::new(pipe.chunks(sz))
-                as Box<dyn Stream<Item = Vec<Result<(K, V), anyhow::Error>>> + Unpin>,
-            ChunkType::Time(dur) => Box::new(IntervalChunks::from_pipe(pipe, dur))
-                as Box<dyn Stream<Item = Vec<Result<(K, V), anyhow::Error>>> + Unpin>,
+                as Box<
+                    dyn Stream<Item = Vec<Result<(K, V), anyhow::Error>>>
+                        + Unpin,
+                >,
+            ChunkType::Time(dur) => {
+                Box::new(IntervalChunks::from_pipe(pipe, dur))
+                    as Box<
+                        dyn Stream<Item = Vec<Result<(K, V), anyhow::Error>>>
+                            + Unpin,
+                    >
+            }
         };
         PipeChunked { inner }
     }
@@ -336,7 +387,10 @@ where
     K: Encodable + Send,
 {
     type Item = Vec<Result<(K, V), anyhow::Error>>;
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
         let res = ready!(self.project().inner.as_mut().poll_next(cx));
         Poll::Ready(res)
     }
@@ -349,8 +403,13 @@ where
     V: Encodable + std::fmt::Debug + Send + 'static,
 {
     #[pin]
-    inner:
-        SelectAll<Box<dyn Stream<Item = Either<Result<(K, V), anyhow::Error>, ()>> + Send + Unpin>>,
+    inner: SelectAll<
+        Box<
+            dyn Stream<Item = Either<Result<(K, V), anyhow::Error>, ()>>
+                + Send
+                + Unpin,
+        >,
+    >,
     chunks: Vec<Result<(K, V), anyhow::Error>>,
 }
 
@@ -365,16 +424,17 @@ where
         let mut inner = SelectAll::new();
         inner.push(Box::new(p)
             as Box<
-                dyn Stream<Item = Either<Result<(K, V), anyhow::Error>, ()>> + Send + Unpin,
+                dyn Stream<Item = Either<Result<(K, V), anyhow::Error>, ()>>
+                    + Send
+                    + Unpin,
             >);
         inner.push(Box::new(i)
             as Box<
-                dyn Stream<Item = Either<Result<(K, V), anyhow::Error>, ()>> + Send + Unpin,
+                dyn Stream<Item = Either<Result<(K, V), anyhow::Error>, ()>>
+                    + Send
+                    + Unpin,
             >);
-        IntervalChunks {
-            inner,
-            chunks: Vec::new(),
-        }
+        IntervalChunks { inner, chunks: Vec::new() }
     }
 }
 
@@ -384,7 +444,10 @@ where
     V: Encodable + std::fmt::Debug + Send + 'static,
 {
     type Item = Vec<Result<(K, V), anyhow::Error>>;
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
         let res = ready!(this.inner.as_mut().poll_next(cx));
         match res {
@@ -412,10 +475,7 @@ impl Config {
     pub fn new() -> Self {
         let directory: PathBuf = "./".into();
         let filename: PathBuf = "shed.db".into();
-        Config {
-            directory,
-            filename,
-        }
+        Config { directory, filename }
     }
     pub fn set_dir<P: Into<PathBuf>>(mut self, directory: P) -> Self {
         self.directory = directory.into();
@@ -439,16 +499,16 @@ pub struct Interval {
 
 impl Interval {
     pub fn new(dur: Duration) -> Self {
-        Interval {
-            delay: futures_timer::Delay::new(dur),
-            dur,
-        }
+        Interval { delay: futures_timer::Delay::new(dur), dur }
     }
 }
 
 impl Stream for Interval {
     type Item = ();
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<()>> {
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<()>> {
         let mut this = self.project();
         ready!(this.delay.as_mut().poll(cx));
         this.delay.reset(*this.dur);
