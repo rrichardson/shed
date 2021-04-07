@@ -72,9 +72,9 @@ impl Builder {
 
             let streams = self.gen_stream_members();
             quote! {
-                impl #impl_generics Manifold for #typename #ty_generics #where_clause {
-                    fn connect(ds: Store) -> ::futures::stream::SelectAll<Pin<Box<dyn ::futures::Stream<Item = std::result::Result<Self, anyhow::Error>> + Send>>> {
-                        ::futures::stream::select_all(vec![
+                impl #impl_generics ManifoldAdapter for #typename #ty_generics #where_clause {
+                    fn connect(ds: Store) -> ::shed::Manifold<Pin<Box<dyn ::futures::Stream<Item = std::result::Result<Self, anyhow::Error>> + Send>>> {
+                        ::shed::manifold::manifold(vec![
                         #(#streams)*
                         ])
                     }
@@ -103,12 +103,3 @@ impl Builder {
         }).collect()
     }
 }
-
-/*
-    fn connect(&self, tree: Tree) -> stream::SelectAll<Pin<Box<dyn Stream<Item = Result<(Vec<u8>, TestManifold), anyhow::Error>> + Send>>> {
-        stream::select_all(
-            vec![Pipe::from_sub(tree.watch_prefix(b"foo/"), b"foo/").map(|res| res.map(|(k, v)| (k, TestManifold::Test1(v)))).boxed(),
-                 Pipe::from_sub(tree.watch_prefix(b"bar/"), b"bar/").map(|res| res.map(|(k, v)| (k, TestManifold::Test2(v)))).boxed(),
-                 Pipe::from_sub(tree.watch_prefix(b"baz/"), b"baz/").map(|res| res.map(|(k, v)| (k, TestManifold::Test3(v)))).boxed()])
-    }
- */

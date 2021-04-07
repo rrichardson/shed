@@ -7,7 +7,7 @@ use derive_manifold::Manifold;
 use futures;
 use futures::{pin_mut, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use shed::{Config, Encodable, History, Manifold, Pipe, Shed, Source, Store};
+use shed::{Config, Encodable, History, Manifold, ManifoldAdapter, Pipe, Shed, Source, Store};
 use sled::IVec;
 use std::pin::Pin;
 

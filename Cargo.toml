@@ -12,10 +12,13 @@ bincode = "1"
 dashmap = "4"
 futures = "0.3"
 futures-timer = "3"
+parking_lot = "0.11"
 pin-project = "1"
 serde = { version="1.0.125", features=["derive"] }
 sled = { git="https://github.com/rrichardson/sled",  branch="main" }
 tokio = "1"
+prost = "0.7"
+bytes = "1"
 
 [dev-dependencies]
 async-stream = "0.3"
