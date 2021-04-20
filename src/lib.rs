@@ -1,13 +1,15 @@
 use anyhow;
 use bincode::{DefaultOptions, Options};
+use byteorder::{BigEndian, WriteBytesExt};
 use core::task::{Context, Poll};
 use futures::{
-    future::Either,
     future,
+    future::Either,
     pin_mut, ready,
     stream::{self, SelectAll},
     Future, Stream, StreamExt,
 };
+pub use manifold::Manifold;
 use pin_project::pin_project;
 use serde::{de::DeserializeOwned, Serialize};
 pub use sled;
@@ -15,8 +17,6 @@ use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::Duration;
-
-pub use manifold::Manifold;
 
 pub mod manifold;
 
@@ -42,24 +42,25 @@ impl Shed {
      * This
      */
     #[must_use = "This must be polled in order to pump the data"]
-    pub fn pipe_put<S, K, V>(
+    pub fn pipe_put<S, K1, K2, V>(
         &self,
-        prefix: Vec<u8>,
+        prefix: K1,
         stream: S,
     ) -> impl Future<Output = Result<(), anyhow::Error>>
     where
-        K: Encodable,
+        K1: ToBytes,
+        K2: ToBytes,
         V: Encodable,
-        S: Stream<Item = (K, V)>,
+        S: Stream<Item = Option<(K2, V)>>,
     {
         let tree = self.tree.clone();
         async move {
             pin_mut!(stream);
-            while let Some((k, v)) = stream.next().await {
-                let mut key = prefix.clone();
-                let mut kk = k.ser()?;
+            while let Some(Some((k, v))) = stream.next().await {
+                let mut key = prefix.to_bytes();
+                key.push(b'/');
+                key.extend_from_slice(&k.to_bytes());
                 let vv = v.ser()?;
-                key.append(&mut kk);
                 tree.insert(&key, vv)?;
             }
             Ok(())
@@ -70,14 +71,11 @@ impl Shed {
      *  Subscribe to writes to this shed using a prefix.
      *  This returns a Pipe which implements Stream and some other stuff
      */
-    pub fn pipe_subscribe<
-        K: Encodable + std::fmt::Debug,
-        V: Encodable + std::fmt::Debug,
-    >(
+    pub fn pipe_subscribe<V: Encodable + std::fmt::Debug>(
         &self,
         prefix: &[u8],
-        history: History<K>,
-    ) -> Result<Pipe<K, V>, anyhow::Error> {
+        history: History,
+    ) -> Result<Pipe<V>, anyhow::Error> {
         let iter =
             match history {
                 History::All => {
@@ -97,7 +95,7 @@ impl Shed {
                     }
                 }
                 History::Start(k) => {
-                    let key = k.ser()?;
+                    let key = k.to_bytes();
                     let start = prefix
                         .iter()
                         .map(|a| *a)
@@ -122,13 +120,12 @@ impl Shed {
         ))
     }
 
-    pub fn pipe_subscribe_chunked<K, V>(
+    pub fn pipe_subscribe_chunked<V>(
         &self,
         prefix: &[u8],
         chunk: ChunkType,
-    ) -> PipeChunked<K, V>
+    ) -> PipeChunked<V>
     where
-        K: Encodable + Send + std::fmt::Debug + 'static,
         V: Encodable + Send + std::fmt::Debug + 'static,
     {
         PipeChunked::from_source_and_type(
@@ -142,34 +139,32 @@ impl Shed {
      *  A hose is like a pipe, but it's more flexible.
      *  hose subscribes to a stream, applies a function, then writes it to a new key
      */
-    pub fn hose<F, K1, V1, K2, V2>(
+    pub fn hose<F, V1, V2>(
         &self,
         output_prefix: &[u8],
-        pipe: Pipe<K1, V1>,
+        pipe: Pipe<V1>,
         fun: F,
     ) -> impl Future<Output = Result<(), anyhow::Error>>
     where
-        F: FnMut(Result<Action<K1, V1>, anyhow::Error>) -> (K2, V2),
+        F: FnMut(Result<Action<V1>, anyhow::Error>) -> Option<(Vec<u8>, V2)>,
         V1: Encodable,
-        K1: Encodable,
         V2: Encodable,
-        K2: Encodable,
     {
         let s = pipe.map(fun);
         self.pipe_put(output_prefix.to_vec(), s)
     }
 
-    pub fn chunked_hose<F, K1, V1, K2, V2>(
+    pub fn hose_chunked<F, V1, V2>(
         &self,
         output_prefix: &[u8],
-        pipe: PipeChunked<K1, V1>,
+        pipe: PipeChunked<V1>,
         fun: F,
     ) -> impl Future<Output = Result<(), anyhow::Error>>
     where
-        F: FnMut(Vec<Result<(K1, V1), anyhow::Error>>) -> (K2, V2),
+        F: FnMut(
+            Vec<Result<(Vec<u8>, V1), anyhow::Error>>,
+        ) -> Option<(Vec<u8>, V2)>,
         V1: Encodable + Send,
-        K1: Encodable + Send,
-        K2: Encodable,
         V2: Encodable,
     {
         let s = pipe.map(fun);
@@ -178,15 +173,140 @@ impl Shed {
 
     pub fn manifold_subscribe<M: ManifoldAdapter>(
         &self,
-    ) -> Manifold<Pin<Box<dyn Stream<Item = Result<M, anyhow::Error>> + Send>>,
-    > {
+    ) -> Manifold<Pin<Box<dyn Stream<Item = Result<M, anyhow::Error>> + Send>>>
+    {
         M::connect(Store(self.tree.clone()))
+    }
+
+    pub fn insert<K: ToBytes, V: Encodable>(
+        &self,
+        key: K,
+        val: V,
+    ) -> Result<Option<V>, anyhow::Error> {
+        let kbuf = key.to_bytes();
+        let vbuf = val.ser()?;
+        let vbufopt =
+            self.tree.insert(kbuf, vbuf).map_err(anyhow::Error::new)?;
+        vbufopt.map(|newbuf| V::des(newbuf)).transpose()
+    }
+
+    pub fn remove<K: ToBytes, V: Encodable>(
+        &self,
+        key: K,
+    ) -> Result<Option<V>, anyhow::Error> {
+        let kbuf = key.to_bytes();
+        let vbufopt = self.tree.remove(kbuf).map_err(anyhow::Error::new)?;
+        vbufopt.map(|vbuf| V::des(vbuf)).transpose()
+    }
+
+    pub fn get<K: ToBytes, V: Encodable>(
+        &self,
+        key: K,
+    ) -> Result<Option<V>, anyhow::Error> {
+        let kbuf = key.to_bytes();
+        let vbufopt = self.tree.get(kbuf).map_err(anyhow::Error::new)?;
+        vbufopt.map(|vbuf| V::des(vbuf)).transpose()
+    }
+
+    pub fn prefix_key<K: ToBytes>(prefix: &str, key: &K) -> Vec<u8> {
+        let mut v = Vec::with_capacity(prefix.len() + key.len() + 1);
+        v.extend_from_slice(&prefix.to_bytes());
+        v.push(b'/');
+        v.extend_from_slice(&key.to_bytes());
+        v
     }
 }
 
 pub enum ChunkType {
     Time(Duration),
     Count(usize),
+}
+
+pub trait ToBytes
+where
+    Self: Sized,
+{
+    fn to_bytes(&self) -> Vec<u8>;
+    fn len(&self) -> usize;
+}
+
+impl ToBytes for &str {
+    fn to_bytes(&self) -> Vec<u8> {
+        str::as_bytes(self).to_owned()
+    }
+    fn len(&self) -> usize {
+        str::len(self)
+    }
+}
+
+impl ToBytes for &[u8] {
+    fn to_bytes(&self) -> Vec<u8> {
+        self.to_vec()
+    }
+    fn len(&self) -> usize {
+        <[u8]>::len(self)
+    }
+}
+
+impl ToBytes for Vec<u8> {
+    fn to_bytes(&self) -> Vec<u8> {
+        self.to_owned()
+    }
+    fn len(&self) -> usize {
+        self.len()
+    }
+}
+
+impl ToBytes for String {
+    fn to_bytes(&self) -> Vec<u8> {
+        String::as_bytes(self).to_owned()
+    }
+    fn len(&self) -> usize {
+        self.len()
+    }
+}
+
+impl ToBytes for u64 {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut wtr = Vec::with_capacity(std::mem::size_of::<u64>());
+        wtr.write_u64::<BigEndian>(*self).unwrap();
+        wtr
+    }
+    fn len(&self) -> usize {
+        std::mem::size_of::<u64>()
+    }
+}
+
+impl ToBytes for u32 {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut wtr = Vec::with_capacity(std::mem::size_of::<u32>());
+        wtr.write_u32::<BigEndian>(*self).unwrap();
+        wtr
+    }
+    fn len(&self) -> usize {
+        std::mem::size_of::<u32>()
+    }
+}
+impl ToBytes for i64 {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut wtr = Vec::with_capacity(std::mem::size_of::<i64>());
+        wtr.write_i64::<BigEndian>(*self).unwrap();
+        wtr
+    }
+    fn len(&self) -> usize {
+        std::mem::size_of::<i64>()
+    }
+}
+
+impl ToBytes for i32 {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut wtr = Vec::with_capacity(std::mem::size_of::<i32>());
+        wtr.write_i32::<BigEndian>(*self).unwrap();
+        wtr
+    }
+    fn len(&self) -> usize {
+        std::mem::size_of::<i32>()
+    }
 }
 
 pub trait Encodable
@@ -196,7 +316,6 @@ where
     fn ser(&self) -> Result<Vec<u8>, anyhow::Error>;
     fn des<I: AsRef<[u8]>>(item: I) -> Result<Self, anyhow::Error>;
 }
-
 
 impl<T> Encodable for T
 where
@@ -225,24 +344,24 @@ where
 {
     fn connect(
         ds: Store,
-    ) -> Manifold<Pin<Box<dyn Stream<Item = Result<Self, anyhow::Error>> + Send>>,
-    >;
+    ) -> Manifold<Pin<Box<dyn Stream<Item = Result<Self, anyhow::Error>> + Send>>>;
 }
 
-pub enum Action<K,V> {
-    Insert((K, V)),
-    Remove(K)
+#[derive(Debug)]
+pub enum Action<V> {
+    Insert((Vec<u8>, V)),
+    Remove(Vec<u8>),
 }
 
-impl<K, V> Action<K, V> {
-    pub fn insert(self) -> Option<(K, V)> {
+impl<V> Action<V> {
+    pub fn insert(self) -> Option<(Vec<u8>, V)> {
         if let Action::Insert(ent) = self {
             Some(ent)
         } else {
             None
         }
     }
-    pub fn remove(self) -> Option<K> {
+    pub fn remove(self) -> Option<Vec<u8>> {
         if let Action::Remove(ent) = self {
             Some(ent)
         } else {
@@ -263,33 +382,30 @@ impl Future for Source {
 
 #[must_use = "streams do nothing unless polled"]
 #[pin_project]
-pub struct Pipe<K, V> {
+pub struct Pipe<V> {
     #[pin]
     src: Source,
     prefix: Vec<u8>,
     history: Option<sled::Iter>,
-    batch: Option<Vec<Result<Action<K, V>, anyhow::Error>>>,
+    batch: Option<Vec<Result<Action<V>, anyhow::Error>>>,
     _pv: PhantomData<V>,
-    _pk: PhantomData<K>,
 }
 
-impl<K, V> Pipe<K, V>
+impl<V> Pipe<V>
 where
-    K: Encodable,
     V: Encodable,
 {
     pub fn from_source<P: AsRef<[u8]>>(
         src: Source,
         prefix: P,
         history: Option<sled::Iter>,
-    ) -> Pipe<K, V> {
+    ) -> Pipe<V> {
         Pipe {
             src,
             history,
             batch: None,
             prefix: prefix.as_ref().to_vec(),
             _pv: PhantomData,
-            _pk: PhantomData,
         }
     }
 
@@ -297,8 +413,8 @@ where
         prefix_len: usize,
         key: &sled::IVec,
         value: &Option<sled::IVec>,
-    ) -> Result<Action<K, V>, anyhow::Error> {
-        let k = K::des(&key[prefix_len..])?;
+    ) -> Result<Action<V>, anyhow::Error> {
+        let k = key[prefix_len..].to_vec();
         if let Some(val) = value {
             let v = V::des(val)?;
             Ok(Action::Insert((k, v)))
@@ -308,23 +424,24 @@ where
     }
 }
 
-impl<K, V> Stream for Pipe<K, V>
+impl<V> Stream for Pipe<V>
 where
     V: Encodable,
-    K: Encodable,
 {
-    type Item = Result<Action<K, V>, anyhow::Error>;
+    type Item = Result<Action<V>, anyhow::Error>;
     fn poll_next(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Action<K, V>, anyhow::Error>>> {
+    ) -> Poll<Option<Result<Action<V>, anyhow::Error>>> {
         let mut this = self.project();
         let prefix_len = this.prefix.len();
         // first fetch from our historical iterator if it exists
         if let Some(mut iter) = this.history.take() {
             if let Some(entry) = iter.next() {
                 let res = match entry {
-                    Ok((kk, vv)) => Some(Self::unpack(prefix_len, &kk, &Some(vv))),
+                    Ok((kk, vv)) => {
+                        Some(Self::unpack(prefix_len, &kk, &Some(vv)))
+                    }
                     Err(e) => {
                         println!("{:?}", &e);
                         Some(Err(anyhow::Error::new(e)))
@@ -349,7 +466,7 @@ where
                 let mut b = event
                     .iter()
                     .filter_map(|e| Some(Self::unpack(prefix_len, e.1, e.2)))
-                    .collect::<Vec<Result<Action<K, V>, anyhow::Error>>>();
+                    .collect::<Vec<Result<Action<V>, anyhow::Error>>>();
                 let res = b.pop();
                 this.batch.replace(b);
                 res
@@ -361,53 +478,55 @@ where
 
 #[must_use = "streams do nothing unless polled"]
 #[pin_project]
-pub struct PipeChunked<K, V>
+pub struct PipeChunked<V>
 where
-    K: Encodable + Send,
     V: Encodable + Send,
 {
     #[pin]
-    inner: Box<dyn Stream<Item = Vec<Result<(K, V), anyhow::Error>>> + Unpin>,
+    inner: Box<
+        dyn Stream<Item = Vec<Result<(Vec<u8>, V), anyhow::Error>>> + Unpin,
+    >,
 }
 
-impl<K, V> PipeChunked<K, V>
+impl<V> PipeChunked<V>
 where
-    K: Encodable + Send + std::fmt::Debug + 'static,
     V: Encodable + Send + std::fmt::Debug + 'static,
 {
     pub fn from_source_and_type<P: AsRef<[u8]>>(
         src: Source,
         prefix: P,
         chunk: ChunkType,
-    ) -> PipeChunked<K, V> {
+    ) -> PipeChunked<V> {
         let pipe = Pipe::from_source(src, prefix, None);
         let inner = match chunk {
             ChunkType::Count(sz) => {
-                let pp = pipe.filter_map(|ract| { 
-                    let res = 
-                        match ract { 
-                            Ok(act) => 
-                                if let Action::Insert(ent) = act {
-                                    Some(Ok(ent)) 
-                                } else {
-                                    None
-                                },
-                            Err(e) => Some(Err(e))
-                        };
-                        future::ready(res)
-                    });
+                let pp = pipe.filter_map(|ract| {
+                    let res = match ract {
+                        Ok(act) => {
+                            if let Action::Insert(ent) = act {
+                                Some(Ok(ent))
+                            } else {
+                                None
+                            }
+                        }
+                        Err(e) => Some(Err(e)),
+                    };
+                    future::ready(res)
+                });
                 let ck = pp.chunks(sz);
                 Box::new(ck)
-                as Box<
-                    dyn Stream<Item = Vec<Result<(K, V), anyhow::Error>>>
-                        + Unpin,
-                >
-            },
+                    as Box<
+                        dyn Stream<
+                                Item = Vec<Result<(Vec<u8>, V), anyhow::Error>>,
+                            > + Unpin,
+                    >
+            }
             ChunkType::Time(dur) => {
                 Box::new(IntervalChunks::from_pipe(pipe, dur))
                     as Box<
-                        dyn Stream<Item = Vec<Result<(K, V), anyhow::Error>>>
-                            + Unpin,
+                        dyn Stream<
+                                Item = Vec<Result<(Vec<u8>, V), anyhow::Error>>,
+                            > + Unpin,
                     >
             }
         };
@@ -415,80 +534,78 @@ where
     }
 }
 
-impl<K, V> Stream for PipeChunked<K, V>
+impl<V> Stream for PipeChunked<V>
 where
     V: Encodable + Send,
-    K: Encodable + Send,
 {
-    type Item = Vec<Result<(K, V), anyhow::Error>>;
+    type Item = Vec<Result<(Vec<u8>, V), anyhow::Error>>;
     fn poll_next(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-            self.project().inner.as_mut().poll_next(cx)
+        self.project().inner.as_mut().poll_next(cx)
     }
 }
 
 #[pin_project]
-pub struct IntervalChunks<K, V>
+pub struct IntervalChunks<V>
 where
-    K: Encodable + Send + 'static,
     V: Encodable + Send + 'static,
 {
     #[pin]
     inner: SelectAll<
         Box<
-            dyn Stream<Item = Either<Result<(K, V), anyhow::Error>, ()>>
+            dyn Stream<Item = Either<Result<(Vec<u8>, V), anyhow::Error>, ()>>
                 + Send
                 + Unpin,
         >,
     >,
-    chunks: Vec<Result<(K, V), anyhow::Error>>,
+    chunks: Vec<Result<(Vec<u8>, V), anyhow::Error>>,
 }
 
-impl<K, V> IntervalChunks<K, V>
+impl<V> IntervalChunks<V>
 where
-    K: Encodable + Send + 'static,
     V: Encodable + Send + 'static,
 {
-    pub fn from_pipe(pipe: Pipe<K, V>, dur: Duration) -> IntervalChunks<K, V> {
-        let pp = pipe.filter_map(|ract| { 
-            let res = 
-                match ract { 
-                    Ok(act) => 
-                        if let Action::Insert(ent) = act {
-                            Some(Either::Left(Ok(ent))) 
-                        } else {
-                            None
-                        },
-                    Err(e) => Some(Either::Left(Err(e)))
-                };
-                future::ready(res)
-            });
+    pub fn from_pipe(pipe: Pipe<V>, dur: Duration) -> IntervalChunks<V> {
+        let pp = pipe.filter_map(|ract| {
+            let res = match ract {
+                Ok(act) => {
+                    if let Action::Insert(ent) = act {
+                        Some(Either::Left(Ok(ent)))
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => Some(Either::Left(Err(e))),
+            };
+            future::ready(res)
+        });
         let i = Interval::new(dur).map(|i| Either::Right(i));
         let mut inner = SelectAll::new();
         inner.push(Box::new(pp)
             as Box<
-                dyn Stream<Item = Either<Result<(K, V), anyhow::Error>, ()>>
-                    + Send
+                dyn Stream<
+                        Item = Either<Result<(Vec<u8>, V), anyhow::Error>, ()>,
+                    > + Send
                     + Unpin,
             >);
         inner.push(Box::new(i)
             as Box<
-                dyn Stream<Item = Either<Result<(K, V), anyhow::Error>, ()>>
-                    + Send
+                dyn Stream<
+                        Item = Either<Result<(Vec<u8>, V), anyhow::Error>, ()>,
+                    > + Send
                     + Unpin,
             >);
         IntervalChunks { inner, chunks: Vec::new() }
     }
 }
 
-impl<K, V> Stream for IntervalChunks<K, V>
+impl<V> Stream for IntervalChunks<V>
 where
-    K: Encodable + Send + 'static,
     V: Encodable + Send + 'static,
 {
-    type Item = Vec<Result<(K, V), anyhow::Error>>;
+    type Item = Vec<Result<(Vec<u8>, V), anyhow::Error>>;
     fn poll_next(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -561,8 +678,8 @@ impl Stream for Interval {
     }
 }
 
-pub enum History<K: Encodable> {
-    Start(K),
+pub enum History {
+    Start(Vec<u8>),
     All,
     None,
 }

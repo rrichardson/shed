@@ -3,14 +3,18 @@ extern crate shed;
 use anyhow;
 use async_stream::stream;
 use bincode::{DefaultOptions, Options};
+use byteorder::{BigEndian, ReadBytesExt};
 use derive_manifold::Manifold;
 use futures;
 use futures::{pin_mut, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use shed::{Config, Encodable, History, Manifold, ManifoldAdapter, Pipe, Shed, Source, Store};
+use shed::{
+    Action, Config, Encodable, History, Manifold, ManifoldAdapter, Pipe, Shed,
+    Source, Store, ToBytes,
+};
 use sled::IVec;
+use std::io::Cursor;
 use std::pin::Pin;
-
 #[derive(Serialize, PartialEq, Deserialize, Debug)]
 struct Test1 {
     a: u64,
@@ -32,15 +36,16 @@ struct Test3 {
 #[derive(Manifold, Debug)]
 enum TestManifold {
     #[prefix = "test1/foo"]
-    Test1Item((u64, Test1)),
+    Test1Item(Action<Test1>),
     #[prefix = "test2/bar"]
-    Test2Item((u64, Test2)),
+    Test2Item(Action<Test2>),
     #[prefix = "test3/baz"]
-    Test3Item((u64, Test3)),
+    Test3Item(Action<Test3>),
 }
 
 #[tokio::main(worker_threads = 2)]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>
+{
     // run put_get demo
     put_get().await;
 
@@ -51,49 +56,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     history().await
 }
 
-async fn put_get() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+async fn put_get(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     let config = Config::new().set_dir("/tmp/shed_putget");
     let shed = Shed::new("demo", &config);
     let tree = shed.clone().tree;
     let prefix = b"putgettest";
     let s = stream! {
         for i in 0..300 {
-            yield (i + 100, Test1{ a:i, b: 42});
+            yield Some((i + 100, Test1{ a:i, b: 42}));
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     };
     // create a stream by subscribing to the prefix
-    let getter: Pipe<u64, Test1> = shed.pipe_subscribe(prefix, History::None).unwrap();
+    let getter: Pipe<Test1> =
+        shed.pipe_subscribe(prefix, History::None).unwrap();
 
     // create the writer and spawn it to pump the data into the DB
-    let put = shed.pipe_put(prefix.to_vec(), s);
+    let put = shed.pipe_put(&prefix[..], s);
     tokio::spawn(put);
 
     // Let's see how we did
     // Extract the contents of the getter stream into a Vec
-    let g_results = getter
-        .take(100)
-        .map(|a| a.unwrap())
-        .collect::<Vec<_>>()
-        .await;
+    let g_results =
+        getter.take(100).map(|a| a.unwrap()).collect::<Vec<_>>().await;
     // Use a range directly on the DB to get our comparison data.
     println!("Comparing getter results");
-    let r_results = tree
-        .range(IVec::from(prefix)..)
-        .take(100)
-        .flatten()
-        .map(|(k, v)| {
+    let r_results =
+        tree.range(IVec::from(prefix)..).take(100).flatten().map(|(k, v)| {
             (
-                u64::decode(&k[prefix.len()..]).unwrap(),
-                Test1::decode(v).unwrap(),
+                Cursor::new(&k[prefix.len()..])
+                    .read_u64::<BigEndian>()
+                    .unwrap(),
+                Test1::des(v).unwrap(),
             )
         });
     // Compare
-    if g_results
-        .iter()
-        .zip(r_results)
-        .all(|((k1, v1), (k2, v2))| *k1 == k2 && *v1 == v2)
-    {
+    if g_results.iter().zip(r_results).all(|(act, (k2, v2))| {
+        if let Action::Insert((k1, v1)) = act {
+            let num = Cursor::new(k1).read_u64::<BigEndian>().unwrap();
+            num == k2 && *v1 == v2
+        } else {
+            false
+        }
+    }) {
         println!("We have a match!");
     } else {
         println!("D:")
@@ -101,7 +107,8 @@ async fn put_get() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'stat
     Ok(())
 }
 
-async fn history() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+async fn history(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     let config = Config::new().set_dir("/tmp/shed_history");
     let shed = Shed::new("demo", &config);
     let tree = shed.clone().tree;
@@ -109,20 +116,21 @@ async fn history() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'stat
     // create and spawn a writer for some "historical" data
     let s = stream! {
         for i in 0..100 {
-            yield (i, Test1{ a:i, b: 42});
+            yield Some((i, Test1{ a:i, b: 42}));
         }
     };
     let put = shed.pipe_put(prefix.to_vec(), s);
     put.await.unwrap();
 
     // create a stream by subscribing to the prefix
-    let getter: Pipe<u64, Test1> = shed.pipe_subscribe(prefix, History::All).unwrap();
+    let getter: Pipe<Test1> =
+        shed.pipe_subscribe(prefix, History::All).unwrap();
 
     // create the writer and spawn it to pump the data into the DB
     let t = stream! {
         for i in 100..200 {
             //tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            yield (i, Test1{ a:i, b: 42});
+            yield Some((i, Test1{ a:i, b: 42}));
         }
     };
     let put2 = shed.pipe_put(prefix.to_vec(), t);
@@ -142,22 +150,24 @@ async fn history() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'stat
         .collect::<Vec<_>>()
         .await;
     // Use a range directly on the DB to get our comparison data.
-    let r_results = tree
-        .range(IVec::from(prefix)..)
-        .take(200)
-        .flatten()
-        .map(|(k, v)| {
+    let r_results =
+        tree.range(IVec::from(prefix)..).take(200).flatten().map(|(k, v)| {
             (
-                u64::decode(&k[prefix.len()..]).unwrap(),
-                Test1::decode(v).unwrap(),
+                Cursor::new(&k[prefix.len()..])
+                    .read_u64::<BigEndian>()
+                    .unwrap(),
+                Test1::des(v).unwrap(),
             )
         });
     // Compare
-    if g_results
-        .iter()
-        .zip(r_results)
-        .all(|((k1, v1), (k2, v2))| *k1 == k2 && *v1 == v2)
-    {
+    if g_results.iter().zip(r_results).all(|(act, (k2, v2))| {
+        if let Action::Insert((k1, v1)) = act {
+            let num = Cursor::new(k1).read_u64::<BigEndian>().unwrap();
+            num == k2 && *v1 == v2
+        } else {
+            false
+        }
+    }) {
         println!("We have a match!");
     } else {
         println!("D:")
@@ -165,7 +175,8 @@ async fn history() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'stat
     Ok(())
 }
 
-async fn manifold() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+async fn manifold(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     let config = Config::new().set_dir("/tmp/shed_manifold");
     let shed = Shed::new("demo", &config);
     let prefix1 = b"test1/foo";
@@ -173,19 +184,19 @@ async fn manifold() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'sta
     let prefix3 = b"test3/baz";
     let s = stream! {
         for i in 0..20u64 {
-            yield (i + 100, Test1{ a:i, b: 42});
+            yield Some((i + 100, Test1{ a:i, b: 42}));
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     };
     let t = stream! {
         for i in 0..20u64 {
-            yield (i, Test2{ s: (i*355).to_string(), weee: i as u128 * 1_000_000_000});
+            yield Some((i, Test2{ s: (i*355).to_string(), weee: i as u128 * 1_000_000_000}));
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     };
     let u = stream! {
         for i in 0..20u64 {
-            yield (i, Test3{ a: i as i32 * 3, huh: i.to_string()});
+            yield Some((i, Test3{ a: i as i32 * 3, huh: i.to_string()}));
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     };
@@ -201,18 +212,30 @@ async fn manifold() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'sta
     tokio::spawn(t);
     tokio::spawn(u);
 
-    let mut i = 60;
+    let mut i = 60u64;
     while let Some(foo) = mani.next().await {
         if let Ok(m) = foo {
             match m {
-                TestManifold::Test1Item((key, Test1 { a, b })) => {
-                    println!("key={} a={}, b={}", key, a, b)
+                TestManifold::Test1Item(Action::Insert((
+                    key,
+                    Test1 { a, b },
+                ))) => {
+                    println!("key={:?} a={}, b={}", key, a, b)
                 }
-                TestManifold::Test2Item((key, Test2 { s, weee })) => {
-                    println!("key={} s={}, weee={}", key, s, weee)
+                TestManifold::Test2Item(Action::Insert((
+                    key,
+                    Test2 { s, weee },
+                ))) => {
+                    println!("key={:?} s={}, weee={}", key, s, weee)
                 }
-                TestManifold::Test3Item((key, Test3 { a, huh })) => {
-                    println!("key={} a={}, huh={}", key, a, huh)
+                TestManifold::Test3Item(Action::Insert((
+                    key,
+                    Test3 { a, huh },
+                ))) => {
+                    println!("key={:?} a={}, huh={}", key, a, huh)
+                }
+                _ => {
+                    println!("wat")
                 }
             }
         }
