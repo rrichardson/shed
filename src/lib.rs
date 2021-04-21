@@ -9,6 +9,7 @@ use futures::{
     stream::{self, SelectAll},
     Future, Stream, StreamExt,
 };
+use log::debug;
 pub use manifold::Manifold;
 use pin_project::pin_project;
 use serde::{de::DeserializeOwned, Serialize};
@@ -23,7 +24,7 @@ pub mod manifold;
 #[derive(Clone, Debug)]
 pub struct Shed {
     pub db: sled::Db,
-    pub tree: sled::Tree,
+    tree: sled::Tree,
 }
 
 #[derive(Clone, Debug)]
@@ -185,6 +186,11 @@ impl Shed {
     ) -> Result<Option<V>, anyhow::Error> {
         let kbuf = key.to_bytes();
         let vbuf = val.ser()?;
+        debug!(
+            "inserting {} - value : {:?}",
+            String::from_utf8(kbuf.clone()).unwrap(),
+            &vbuf[0..10]
+        );
         let vbufopt =
             self.tree.insert(kbuf, vbuf).map_err(anyhow::Error::new)?;
         vbufopt.map(|newbuf| V::des(newbuf)).transpose()
@@ -208,10 +214,9 @@ impl Shed {
         vbufopt.map(|vbuf| V::des(vbuf)).transpose()
     }
 
-    pub fn prefix_key<K: ToBytes>(prefix: &str, key: &K) -> Vec<u8> {
-        let mut v = Vec::with_capacity(prefix.len() + key.len() + 1);
+    pub fn prefix_key<K: ToBytes + ?Sized>(prefix: &str, key: K) -> Vec<u8> {
+        let mut v = Vec::with_capacity(prefix.len() + key.len());
         v.extend_from_slice(&prefix.to_bytes());
-        v.push(b'/');
         v.extend_from_slice(&key.to_bytes());
         v
     }
@@ -230,9 +235,22 @@ where
     fn len(&self) -> usize;
 }
 
+impl<T> ToBytes for &T
+where
+    T: ToBytes,
+{
+    fn to_bytes(&self) -> Vec<u8> {
+        <T as ToBytes>::to_bytes(self)
+    }
+
+    fn len(&self) -> usize {
+        <T as ToBytes>::len(self)
+    }
+}
+
 impl ToBytes for &str {
     fn to_bytes(&self) -> Vec<u8> {
-        str::as_bytes(self).to_owned()
+        self.as_bytes().to_vec()
     }
     fn len(&self) -> usize {
         str::len(self)
@@ -322,6 +340,14 @@ where
     T: Serialize + DeserializeOwned,
 {
     fn ser(&self) -> Result<Vec<u8>, anyhow::Error> {
+        serde_json::to_vec(self).map_err(anyhow::Error::new)
+    }
+
+    fn des<I: AsRef<[u8]>>(item: I) -> Result<Self, anyhow::Error> {
+        serde_json::from_slice(item.as_ref()).map_err(anyhow::Error::new)
+    }
+    /*
+    fn ser(&self) -> Result<Vec<u8>, anyhow::Error> {
         DefaultOptions::new()
             .with_fixint_encoding()
             .with_big_endian()
@@ -336,6 +362,7 @@ where
             .deserialize(item.as_ref())
             .map_err(anyhow::Error::new)
     }
+    */
 }
 
 pub trait ManifoldAdapter
@@ -400,6 +427,12 @@ where
         prefix: P,
         history: Option<sled::Iter>,
     ) -> Pipe<V> {
+        let p = prefix.as_ref().to_vec();
+        debug!(
+            "creating pipe {} - len {}",
+            String::from_utf8(p).unwrap(),
+            prefix.as_ref().len()
+        );
         Pipe {
             src,
             history,
@@ -416,6 +449,12 @@ where
     ) -> Result<Action<V>, anyhow::Error> {
         let k = key[prefix_len..].to_vec();
         if let Some(val) = value {
+            debug!(
+                "unpacking {} - prefix_len: {} - value: {}",
+                String::from_utf8(key.to_vec()).unwrap(),
+                prefix_len,
+                String::from_utf8(val.to_vec()).unwrap()
+            );
             let v = V::des(val)?;
             Ok(Action::Insert((k, v)))
         } else {
@@ -442,18 +481,11 @@ where
                     Ok((kk, vv)) => {
                         Some(Self::unpack(prefix_len, &kk, &Some(vv)))
                     }
-                    Err(e) => {
-                        println!("{:?}", &e);
-                        Some(Err(anyhow::Error::new(e)))
-                    }
+                    Err(e) => Some(Err(anyhow::Error::new(e))),
                 };
                 *this.history = Some(iter);
                 return Poll::Ready(res);
-            } else {
-                println!("no iter.next()");
             }
-        } else {
-            println!("no history?");
         }
         // no historical iterator, let's try a batch that we got from polling
         if let Some(entry) = this.batch.as_mut().and_then(|b| b.pop()) {

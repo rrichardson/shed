@@ -20,6 +20,9 @@ tokio = "1"
 prost = "0.7"
 bytes = "1"
 byteorder = "1.4.3"
+env_logger = "0.8.3"
+log = "0.4.14"
+serde_json = "1.0.64"
 
 [dev-dependencies]
 async-stream = "0.3"

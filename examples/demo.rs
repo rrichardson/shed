@@ -60,7 +60,6 @@ async fn put_get(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     let config = Config::new().set_dir("/tmp/shed_putget");
     let shed = Shed::new("demo", &config);
-    let tree = shed.clone().tree;
     let prefix = b"putgettest";
     let s = stream! {
         for i in 0..300 {

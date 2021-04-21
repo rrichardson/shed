@@ -34,9 +34,7 @@ pub struct Manifold<St> {
 
 impl<St> Clone for Manifold<St> {
     fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone()
-        }
+        Self { inner: self.inner.clone() }
     }
 }
 
@@ -65,6 +63,10 @@ impl<St: Stream + Unpin> Manifold<St> {
     /// Returns `true` if the set contains no streams
     pub fn is_empty(&self) -> bool {
         self.inner.lock().is_empty()
+    }
+
+    pub fn remove(&self, _id: u64) -> bool {
+        true
     }
 
     /// Push a stream into the set.
