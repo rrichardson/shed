@@ -4,6 +4,7 @@
 //! a mutex in order for the high-level future to be able to accept pushes from any thread at any
 //! time.  It might diverge more in the future
 
+use crate::stream::{FuturesUnordered, StreamExt, StreamFuture};
 use core::fmt::{self, Debug};
 use core::iter::FromIterator;
 use core::pin::Pin;
@@ -12,8 +13,6 @@ use futures::stream::{FusedStream, Stream};
 use futures::task::{Context, Poll};
 use parking_lot::Mutex;
 use std::sync::Arc;
-
-use crate::stream::{FuturesUnordered, StreamExt, StreamFuture};
 
 /// An unbounded set of streams
 ///
@@ -106,7 +105,9 @@ impl<St: Stream + Unpin> Stream for Manifold<St> {
                     // We do not return, but poll `FuturesUnordered`
                     // in the next loop iteration.
                 }
-                None => return Poll::Ready(None),
+                // If FuturesUnordered says it's done, we ignore
+                // that and prepare for more
+                None => return Poll::Pending,
             }
         }
     }

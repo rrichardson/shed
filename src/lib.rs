@@ -1,5 +1,4 @@
 use anyhow;
-use bincode::{DefaultOptions, Options};
 use byteorder::{BigEndian, WriteBytesExt};
 use core::task::{Context, Poll};
 use futures::{
@@ -9,7 +8,7 @@ use futures::{
     stream::{self, SelectAll},
     Future, Stream, StreamExt,
 };
-use log::debug;
+use log::trace;
 pub use manifold::Manifold;
 use pin_project::pin_project;
 use serde::{de::DeserializeOwned, Serialize};
@@ -186,7 +185,7 @@ impl Shed {
     ) -> Result<Option<V>, anyhow::Error> {
         let kbuf = key.to_bytes();
         let vbuf = val.ser()?;
-        debug!(
+        trace!(
             "inserting {} - value : {:?}",
             String::from_utf8(kbuf.clone()).unwrap(),
             &vbuf[0..10]
@@ -428,7 +427,7 @@ where
         history: Option<sled::Iter>,
     ) -> Pipe<V> {
         let p = prefix.as_ref().to_vec();
-        debug!(
+        trace!(
             "creating pipe {} - len {}",
             String::from_utf8(p).unwrap(),
             prefix.as_ref().len()
@@ -449,7 +448,7 @@ where
     ) -> Result<Action<V>, anyhow::Error> {
         let k = key[prefix_len..].to_vec();
         if let Some(val) = value {
-            debug!(
+            trace!(
                 "unpacking {} - prefix_len: {} - value: {}",
                 String::from_utf8(key.to_vec()).unwrap(),
                 prefix_len,

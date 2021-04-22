@@ -8,7 +8,6 @@ edition = "2018"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-bincode = "1"
 dashmap = "4"
 futures = "0.3"
 futures-timer = "3"
