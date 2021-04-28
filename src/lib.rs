@@ -8,7 +8,7 @@ use futures::{
     stream::{self, SelectAll},
     Future, Stream, StreamExt,
 };
-use log::trace;
+use log::{debug, info, trace};
 pub use manifold::Manifold;
 use pin_project::pin_project;
 use serde::{de::DeserializeOwned, Serialize};
@@ -76,23 +76,15 @@ impl Shed {
         prefix: &[u8],
         history: History,
     ) -> Result<Pipe<V>, anyhow::Error> {
+        trace!(
+            "{:?} pipe_subscribe {}",
+            std::thread::current().id(),
+            String::from_utf8_lossy(prefix)
+        );
         let iter =
             match history {
                 History::All => {
-                    let start = self.tree.get_gt(sled::IVec::from(prefix))?;
-                    let scan = self.tree.scan_prefix(sled::IVec::from(prefix));
-                    let last = scan.last();
-                    if let Some((begin, _)) = start {
-                        if let Some(Ok((end, _))) = last {
-                            Some(self.tree.range(
-                                sled::IVec::from(begin)..=sled::IVec::from(end),
-                            ))
-                        } else {
-                            Some(self.tree.range(sled::IVec::from(begin)..))
-                        }
-                    } else {
-                        None
-                    }
+                    Some(self.tree.scan_prefix(sled::IVec::from(prefix)))
                 }
                 History::Start(k) => {
                     let key = k.to_bytes();
@@ -187,8 +179,8 @@ impl Shed {
         let vbuf = val.ser()?;
         trace!(
             "inserting {} - value : {:?}",
-            String::from_utf8(kbuf.clone()).unwrap(),
-            &vbuf[0..10]
+            String::from_utf8_lossy(kbuf.as_slice()),
+            String::from_utf8_lossy(vbuf.as_slice())
         );
         let vbufopt =
             self.tree.insert(kbuf, vbuf).map_err(anyhow::Error::new)?;
@@ -447,13 +439,15 @@ where
         value: &Option<sled::IVec>,
     ) -> Result<Action<V>, anyhow::Error> {
         let k = key[prefix_len..].to_vec();
+        trace!(
+            "{:?} unpacking {} - Some(value) : {} - prefix_len: {}",
+            std::thread::current().id(),
+            String::from_utf8_lossy(&key),
+            value.is_some(),
+            prefix_len
+        );
         if let Some(val) = value {
-            trace!(
-                "unpacking {} - prefix_len: {} - value: {}",
-                String::from_utf8(key.to_vec()).unwrap(),
-                prefix_len,
-                String::from_utf8(val.to_vec()).unwrap()
-            );
+            trace!("value: {}", String::from_utf8_lossy(&val));
             let v = V::des(val)?;
             Ok(Action::Insert((k, v)))
         } else {
@@ -478,9 +472,21 @@ where
             if let Some(entry) = iter.next() {
                 let res = match entry {
                     Ok((kk, vv)) => {
+                        trace!(
+                            "{:?} Processing entry from history : {}",
+                            std::thread::current().id(),
+                            String::from_utf8_lossy(&kk),
+                        );
                         Some(Self::unpack(prefix_len, &kk, &Some(vv)))
                     }
-                    Err(e) => Some(Err(anyhow::Error::new(e))),
+                    Err(e) => {
+                        trace!(
+                            "{:?} Got err from history item: {:?}",
+                            std::thread::current().id(),
+                            &e
+                        );
+                        Some(Err(anyhow::Error::new(e)))
+                    }
                 };
                 *this.history = Some(iter);
                 return Poll::Ready(res);
@@ -488,12 +494,20 @@ where
         }
         // no historical iterator, let's try a batch that we got from polling
         if let Some(entry) = this.batch.as_mut().and_then(|b| b.pop()) {
+            trace!(
+                "{:?} Processing entry from existing event batch",
+                std::thread::current().id()
+            );
             return Poll::Ready(Some(entry));
         }
         // if we're still here, the iterator and the batch is out, so let's
         // poll for a new batch and return an item from it
         let res = ready!(this.src.as_mut().poll(cx)).and_then(
             |event: sled::Event| {
+                trace!(
+                    "{:?} Processing entry from new event batch",
+                    std::thread::current().id()
+                );
                 let mut b = event
                     .iter()
                     .filter_map(|e| Some(Self::unpack(prefix_len, e.1, e.2)))
@@ -656,8 +670,6 @@ where
         }
     }
 }
-
-pub struct Hose {}
 
 pub struct Config {
     directory: PathBuf,
