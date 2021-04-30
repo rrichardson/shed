@@ -23,7 +23,7 @@ pub mod manifold;
 #[derive(Clone, Debug)]
 pub struct Shed {
     pub db: sled::Db,
-    tree: sled::Tree,
+    pub tree: sled::Tree,
 }
 
 #[derive(Clone, Debug)]
